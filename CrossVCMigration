@@ -1,0 +1,181 @@
+$SourceVC1 = "SourceVC1"
+$SourceVC2 = "SourceVC2"
+$destVC = "DestVC"
+$vmnames = ListOfVMs
+
+#connect to source and destination VC servers
+$SourceVC1Conn = Connect-VIServer -Server $SourceVC1
+$SourceVC2Conn = Connect-VIServer -Server $SourceVC2
+$destVCConn = Connect-VIServer -Server $destVC 
+
+
+$SourceVMList = get-vm -Server $SourceVC2Conn
+$SourceVMListNames = $SourceVMList.name
+
+foreach ($vmname in $SourceVMListNames){
+$totalsleeptime= 0
+if (($SourceVMListNames -contains $vmname) -eq $true){
+    $sourceVCConn = $SourceVC2
+    $DRSGroup = "DestDRSGroupName2"
+    $Tag = "DestBackupTagName2"
+    }
+else{
+    $sourceVCConn = $SourceVC1
+    $DRSGroup = "DestDRSGroupName1"
+    $Tag = "DestBackupTagName1"
+    }
+
+    #get VM
+    try {
+        $vm = Get-VM $vmname -Server $sourceVCConn -ErrorAction STOP
+         }
+    catch{
+        write-warning -Message "unable to get VM details "
+        continue
+        }
+    
+    #Get Datastore
+    try {
+        $Datastore = $vm | Get-Datastore -ErrorAction STOP
+        }
+    catch{
+        write-warning -Message "unable to get datastore details "
+        continue
+        }
+        
+$Datastore = $Datastore.name
+
+        #Get Networks and define them in destination
+        $destinationPortGroup = @()
+    try {
+        $networkAdapters = Get-NetworkAdapter -VM $vm -Server $sourceVCConn -ErrorAction STOP
+            foreach ($networkAdapter in $networkAdapters){
+                $portgroup = $networkAdapter.NetworkName 
+                $destinationPortGroup += Get-VDPortgroup  -Server $destVCConn -VDSwitch "VAGeneral" -Name $portgroup
+                }
+        }
+    catch{
+        write-warning -Message "unable to get network details "
+        continue
+        }
+
+    #define the host on the destination that you are going to migrate to as the first host in the destinations cluster, if you are running DRS this will likely move of poweron
+     try {
+        $destination = Get-Cluster –Name "ClusterName" –Server $destVCConn | Get-VMHost | Select-Object –First 1 -ErrorAction STOP
+        }
+    catch{
+        write-warning -Message "unable to get detination host details "
+        continue
+        }
+
+    #define the datastore on the destination that you are going to migrate to
+    try {
+        $destinationDatastore = Get-Datastore $Datastore -Server $destVCConn -ErrorAction STOP
+        }
+    catch{
+        write-warning -Message "unable to get detination datastore details  "
+        continue
+        }
+
+    #confirm or create VM folder
+
+    $folder = $vm.folder
+    $folder = $folder.name
+    $destFolder = get-folder -Server $destVCConn -type VM
+    $destFolder = $DestFolder.name
+
+    if ($destFolder -notcontains $folder){
+        Get-Datacenter "DCName" –Server $destVCConn  |get-folder vm | new-folder $folder
+        }
+
+    #shutdown the VM with a maximum wait time of 10 minutes
+    try {
+        $Toolsstatus = ($vm | get-view).guest.ToolsRunningStatus
+
+        if  ($vm.PowerState -eq "PoweredOn"){
+
+            if( $Toolsstatus -eq "guestToolsRunning"){
+
+                Shutdown-VMGuest -VM $vm -Confirm:$false -ErrorAction STOP
+
+            }
+
+            else{
+
+                Stop-VM -VM $vm -Confirm:$false -ErrorAction STOP
+
+            }
+         }
+
+
+        do{
+            
+            write-warning -Message "$vmname waiting to poweroff"
+            $vm = Get-VM $vmname -Server $sourceVCConn 
+            $status = $vm.PowerState
+            $totalsleeptime=$totalsleeptime + 10
+            sleep 10
+        }
+       until (($totalsleeptime -eq 600) -or ($vm.Guest.State -eq "NotRunning")) 
+       #until ($vm.Guest.State -eq "NotRunning")
+       }
+   catch{
+        write-warning -Message "unable to shutdown $VM"
+        continue
+        }
+
+        if ($vm.Guest.State -eq "Running"){
+            Stop-VM -VM $vm -Confirm:$false -ErrorAction STOP
+            }
+
+sleep 10
+        #unmount any CDs
+
+        Get-VM $vm | Get-CDDrive | where { $_.IsoPath -or $_.HostDevice -or $_.RemoteDevice -ne $null} | Set-CDDrive -NoMedia -Confirm:$false
+sleep 5
+
+    #move the VM
+    try {
+        Move-VM -VM $vm -Destination $destination -NetworkAdapter $networkAdapters -PortGroup $destinationPortGroup -Datastore $destinationDatastore -ErrorAction STOP
+        }
+    catch{
+        write-warning -Message "unable to move $VM to new farm "
+        continue
+        }
+        sleep 10
+    #set DRS group
+    try {
+        Set-DrsClusterGroup $DRSGroup -vm $vmname -server $destVCConn -add
+        }
+    catch {
+        write-warning -Message "unable to add $VM to DRS Rule "
+        continue
+        }
+    
+    #move VM to folder
+    try {
+        Get-VM $vmname -Server $destVCConn | move-vm -InventoryLocation $folder -ErrorAction STOP
+        }
+    catch{
+        write-warning -Message "Unable to Move $vm to folder "
+        continue
+        }
+          #power on the VM at the destination
+    try {
+        Get-VM $vmname -Server $destVCConn | Start-VM -ErrorAction STOP
+        }
+    catch{
+        write-warning -Message "unable to start $VM "
+        continue
+        }
+
+    #Set Tag
+    try {
+        New-TagAssignment -tag $tag -Entity $vmname -Server $destVCConn -ErrorAction STOP
+        }
+    catch{
+        write-warning -Message "Unable to set VM Tag on $vm "
+        continue
+        }
+      
+   }
